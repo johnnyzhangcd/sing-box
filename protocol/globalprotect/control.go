@@ -22,15 +22,15 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
-	"github.com/sagernet/sing/service"
+	N "github.com/sagernet/sing/common/network"
 	"golang.org/x/net/proxy"
 )
 
@@ -40,8 +40,7 @@ type portalClient struct {
 	serverHost  string
 	localHost   string
 	reportedOS  string
-	dnsRouter   adapter.DNSRouter
-	tlsConfig   *tls.Config
+	tlsRoots    *x509.CertPool
 	dialContext func(context.Context, string, string) (net.Conn, error)
 
 	controlMu     sync.Mutex
@@ -51,6 +50,7 @@ type portalClient struct {
 
 	sessionMu   sync.Mutex
 	activeState *sessionState
+	sessionWake chan struct{}
 }
 
 type tunnelSessionDialer interface {
@@ -64,15 +64,57 @@ func classifyPortalError(message string) error {
 	if strings.Contains(strings.ToLower(message), "portal does not exist") {
 		return fmt.Errorf("%w: %s", errPortalUnavailable, message)
 	}
-	return E.New(message)
+	err := E.New(message)
+	lowerMessage := strings.ToLower(message)
+	// Strong credential and account failures must win over generic transient
+	// words such as "temporarily" to avoid retrying a locked account.
+	if strings.Contains(lowerMessage, "account") &&
+		(strings.Contains(lowerMessage, "disabled") || strings.Contains(lowerMessage, "locked")) {
+		return markPermanentRetry(err)
+	}
+	for _, marker := range []string{
+		"invalid credential",
+		"invalid password",
+		"invalid user",
+		"invalid username",
+		"not authorized",
+		"unauthorized",
+	} {
+		if strings.Contains(lowerMessage, marker) {
+			return markPermanentRetry(err)
+		}
+	}
+	for _, marker := range []string{
+		"backend unavailable",
+		"server error",
+		"service error",
+		"temporar",
+		"timed out",
+		"timeout",
+	} {
+		if strings.Contains(lowerMessage, marker) {
+			return err
+		}
+	}
+	for _, marker := range []string{
+		"authentication failed",
+		"authentication failure",
+		"login failed",
+	} {
+		if strings.Contains(lowerMessage, marker) {
+			return markPermanentRetry(err)
+		}
+	}
+	return err
 }
 
 type sessionState struct {
-	GatewayURL   *url.URL
-	Cookie       string
-	TunnelURL    string
-	TunnelConfig tunnelConfig
-	AppVersion   string
+	GatewayURL       *url.URL
+	Cookie           string
+	TunnelURL        string
+	TunnelConfig     tunnelConfig
+	AppVersion       string
+	HIPCheckInterval time.Duration
 }
 
 func newPortalClient(ctx context.Context, options option.GlobalProtectEndpointOptions) (*portalClient, error) {
@@ -90,25 +132,25 @@ func newPortalClient(ctx context.Context, options option.GlobalProtectEndpointOp
 		localHost = "sing-box"
 	}
 
-	serverName := strings.TrimSpace(options.SNI)
-	if serverName == "" {
-		serverName = baseURL.Hostname()
-	}
-
-	tlsConfig, err := buildTLSConfig(options, serverName)
+	tlsRoots, err := buildRootCAs(options)
 	if err != nil {
 		return nil, err
 	}
 	baseURL = logicalServerURL(baseURL, options.SNI)
 
-	dnsRouter := service.FromContext[adapter.DNSRouter](ctx)
-	dialer, err := buildProxyDialer(ctx, options, dnsRouter)
+	controlDialer, err := buildProxyDialer(ctx, options)
 	if err != nil {
 		return nil, err
 	}
 
 	dialContext := func(ctx context.Context, network, address string) (net.Conn, error) {
-		return dialWithContext(ctx, dialer, network, address)
+		// Pin an explicitly configured server IP before handing the target to a
+		// SOCKS dialer. The proxy's forward dialer only sees the proxy address,
+		// so applying the pin there alone would leak the SNI hostname to SOCKS.
+		if pinnedAddress, ok := pinnedControlAddress(options, address); ok {
+			address = pinnedAddress
+		}
+		return dialWithContext(ctx, controlDialer, network, address)
 	}
 
 	client := &portalClient{
@@ -117,9 +159,9 @@ func newPortalClient(ctx context.Context, options option.GlobalProtectEndpointOp
 		serverHost:  baseURL.Hostname(),
 		localHost:   localHost,
 		reportedOS:  options.ReportedOS,
-		dnsRouter:   dnsRouter,
-		tlsConfig:   tlsConfig,
+		tlsRoots:    tlsRoots,
 		dialContext: dialContext,
+		sessionWake: make(chan struct{}, 1),
 	}
 	return client, nil
 }
@@ -134,6 +176,58 @@ func (d proxyForwardDialer) Dial(network, address string) (net.Conn, error) {
 
 func (d proxyForwardDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	return d.dial(ctx, network, address)
+}
+
+type standardControlDialer struct {
+	ctx       context.Context
+	options   option.GlobalProtectEndpointOptions
+	ipDialer  N.Dialer
+	domainMu  sync.Mutex
+	domain    N.Dialer
+	domainErr error
+}
+
+func newStandardControlDialer(ctx context.Context, options option.GlobalProtectEndpointOptions) (*standardControlDialer, error) {
+	ipDialer, err := dialer.NewWithOptions(dialer.Options{
+		Context:   ctx,
+		Options:   options.DialerOptions,
+		NewDialer: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &standardControlDialer{
+		ctx:      ctx,
+		options:  options,
+		ipDialer: ipDialer,
+	}, nil
+}
+
+func (d *standardControlDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	destination := M.ParseSocksaddr(address)
+	if !destination.IsValid() {
+		return nil, E.New("invalid address: ", address)
+	}
+	selectedDialer := d.ipDialer
+	if destination.IsDomain() {
+		d.domainMu.Lock()
+		if d.domain == nil && d.domainErr == nil {
+			d.domain, d.domainErr = dialer.NewWithOptions(dialer.Options{
+				Context:          d.ctx,
+				Options:          d.options.DialerOptions,
+				RemoteIsDomain:   true,
+				ResolverOnDetour: true,
+				NewDialer:        true,
+			})
+		}
+		selectedDialer = d.domain
+		domainErr := d.domainErr
+		d.domainMu.Unlock()
+		if domainErr != nil {
+			return nil, domainErr
+		}
+	}
+	return selectedDialer.DialContext(ctx, network, destination)
 }
 
 func parseServerURL(server string, serverPort uint16) (*url.URL, error) {
@@ -225,25 +319,12 @@ func pinnedControlAddress(options option.GlobalProtectEndpointOptions, address s
 	return net.JoinHostPort(baseAddress.String(), targetPort), true
 }
 
-func buildProxyDialer(ctx context.Context, options option.GlobalProtectEndpointOptions, dnsRouter adapter.DNSRouter) (proxy.Dialer, error) {
-	netDialer := &net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
+func buildProxyDialer(ctx context.Context, options option.GlobalProtectEndpointOptions) (proxy.Dialer, error) {
+	standardDialer, err := newStandardControlDialer(ctx, options)
+	if err != nil {
+		return nil, err
 	}
-	if options.BindInterface != "" {
-		bindFunc := control.BindToInterface(control.NewDefaultInterfaceFinder(), options.BindInterface, -1)
-		netDialer.Control = control.Append(netDialer.Control, bindFunc)
-	}
-	directDialer := proxyForwardDialer{dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-		if pinnedAddress, ok := pinnedControlAddress(options, address); ok {
-			address = pinnedAddress
-		}
-		destination, err := resolveDialTarget(ctx, network, address, dnsRouter)
-		if err != nil {
-			return nil, err
-		}
-		return netDialer.DialContext(ctx, network, destination.String())
-	}}
+	directDialer := proxyForwardDialer{dial: standardDialer.DialContext}
 	if strings.TrimSpace(options.Proxy) == "" {
 		return directDialer, nil
 	}
@@ -252,59 +333,6 @@ func buildProxyDialer(ctx context.Context, options option.GlobalProtectEndpointO
 		return nil, E.Cause(err, "parse proxy URL")
 	}
 	return proxy.FromURL(parsed, directDialer)
-}
-
-func resolveDialTarget(ctx context.Context, network, address string, dnsRouter adapter.DNSRouter) (M.Socksaddr, error) {
-	destination := M.ParseSocksaddr(address)
-	if destination.IsDomain() {
-		lookupNetwork := "ip"
-		switch {
-		case strings.Contains(network, "4"):
-			lookupNetwork = "ip4"
-		case strings.Contains(network, "6"):
-			lookupNetwork = "ip6"
-		}
-		if dnsRouter != nil {
-			addresses, err := dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
-			if err != nil {
-				return M.Socksaddr{}, err
-			}
-			if len(addresses) == 0 {
-				return M.Socksaddr{}, E.New("no address found for ", destination.Fqdn)
-			}
-			for _, addr := range addresses {
-				switch lookupNetwork {
-				case "ip4":
-					if addr.Is4() {
-						destination.Addr = addr
-						goto resolved
-					}
-				case "ip6":
-					if addr.Is6() {
-						destination.Addr = addr
-						goto resolved
-					}
-				default:
-					destination.Addr = addr
-					goto resolved
-				}
-			}
-			return M.Socksaddr{}, E.New("no address found for ", destination.Fqdn)
-		}
-		addresses, err := net.DefaultResolver.LookupNetIP(ctx, lookupNetwork, destination.Fqdn)
-		if err != nil {
-			return M.Socksaddr{}, err
-		}
-		if len(addresses) == 0 {
-			return M.Socksaddr{}, E.New("no address found for ", destination.Fqdn)
-		}
-		destination.Addr = addresses[0]
-	}
-resolved:
-	if !destination.Addr.IsValid() {
-		return M.Socksaddr{}, E.New("invalid address: ", address)
-	}
-	return destination, nil
 }
 
 func dialWithContext(ctx context.Context, d proxy.Dialer, network, address string) (net.Conn, error) {
@@ -386,12 +414,16 @@ func buildTLSConfig(options option.GlobalProtectEndpointOptions, serverName stri
 	if err != nil {
 		return nil, err
 	}
+	return buildTLSConfigWithRoots(options, roots, serverName), nil
+}
+
+func buildTLSConfigWithRoots(options option.GlobalProtectEndpointOptions, roots *x509.CertPool, serverName string) *tls.Config {
 	cfg := &tls.Config{
 		ServerName:         serverName,
 		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: true,
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			return verifyPeerCertificate(rawCerts, roots, serverName, options.ServerCert)
+			return markPermanentRetry(verifyPeerCertificate(rawCerts, roots, serverName, options.ServerCert))
 		},
 	}
 	if options.AllowInsecureCrypto {
@@ -401,7 +433,7 @@ func buildTLSConfig(options option.GlobalProtectEndpointOptions, serverName stri
 	if options.PFS {
 		cfg.CipherSuites = pfsCipherSuites(options.AllowInsecureCrypto)
 	}
-	return cfg, nil
+	return cfg
 }
 
 func allCipherSuites() []uint16 {
@@ -529,12 +561,28 @@ func (c *portalClient) rememberSession(state *sessionState) {
 	c.sessionMu.Lock()
 	c.activeState = state
 	c.sessionMu.Unlock()
+	select {
+	case c.sessionWake <- struct{}{}:
+	default:
+	}
 }
 
 func (c *portalClient) session() *sessionState {
 	c.sessionMu.Lock()
 	defer c.sessionMu.Unlock()
 	return c.activeState
+}
+
+func (c *portalClient) sessionChanges() <-chan struct{} {
+	return c.sessionWake
+}
+
+func (c *portalClient) recheckHIP(ctx context.Context) (bool, error) {
+	state := c.session()
+	if state == nil || state.GatewayURL == nil || state.Cookie == "" {
+		return false, E.New("missing active GlobalProtect session for HIP check")
+	}
+	return c.checkHIP(ctx, state.GatewayURL, state.Cookie, state.TunnelConfig, state.AppVersion)
 }
 
 func (c *portalClient) closeControl() error {
@@ -616,7 +664,11 @@ func (c *portalClient) ensureControlConnLocked(ctx context.Context, target *url.
 	if err != nil {
 		return nil, nil, err
 	}
-	tlsConn := tls.Client(rawConn, c.tlsConfig.Clone())
+	serverName := target.Hostname()
+	if configuredServerName := strings.TrimSpace(c.options.SNI); configuredServerName != "" {
+		serverName = configuredServerName
+	}
+	tlsConn := tls.Client(rawConn, buildTLSConfigWithRoots(c.options, c.tlsRoots, serverName))
 	if err = tlsConn.HandshakeContext(ctx); err != nil {
 		_ = rawConn.Close()
 		return nil, nil, err
@@ -636,12 +688,57 @@ func (c *bufferedConn) Read(p []byte) (int, error) {
 	return c.reader.Read(p)
 }
 
+func watchControlContext(ctx context.Context, conn net.Conn) func() bool {
+	var fired atomic.Bool
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(done)
+		fired.Store(true)
+		_ = conn.SetDeadline(time.Now())
+	})
+	return func() bool {
+		if !stop() {
+			<-done
+		}
+		return fired.Load()
+	}
+}
+
+func prepareControlIO(ctx context.Context, conn net.Conn) func() bool {
+	deadline := time.Now().Add(30 * time.Second)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	_ = conn.SetDeadline(deadline)
+	return watchControlContext(ctx, conn)
+}
+
+func controlContextError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
+}
+
 func (c *portalClient) doRequest(ctx context.Context, method string, target *url.URL, contentType string, body []byte) ([]byte, error) {
 	c.controlMu.Lock()
 	defer c.controlMu.Unlock()
 	conn, responseReader, err := c.ensureControlConnLocked(ctx, target)
 	if err != nil {
 		return nil, err
+	}
+	stopContextWatch := prepareControlIO(ctx, conn)
+	contextWatchActive := true
+	defer func() {
+		if contextWatchActive {
+			stopContextWatch()
+		}
+	}()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		stopContextWatch()
+		contextWatchActive = false
+		c.closeControlConnLocked()
+		return nil, ctxErr
 	}
 	var reader io.Reader
 	if len(body) > 0 {
@@ -658,26 +755,27 @@ func (c *portalClient) doRequest(ctx context.Context, method string, target *url
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
-	deadline := time.Now().Add(30 * time.Second)
-	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
-		deadline = contextDeadline
-	}
-	_ = conn.SetDeadline(deadline)
 	if err = req.Write(conn); err != nil {
 		c.closeControlConnLocked()
-		return nil, err
+		return nil, controlContextError(ctx, err)
 	}
 	resp, err := http.ReadResponse(responseReader, req)
 	if err != nil {
 		c.closeControlConnLocked()
-		return nil, err
+		return nil, controlContextError(ctx, err)
 	}
 	defer resp.Body.Close()
 	const maxControlResponse = 16 << 20
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxControlResponse+1))
 	if err != nil {
 		c.closeControlConnLocked()
-		return nil, err
+		return nil, controlContextError(ctx, err)
+	}
+	stopContextWatch()
+	contextWatchActive = false
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		c.closeControlConnLocked()
+		return nil, ctxErr
 	}
 	_ = conn.SetDeadline(time.Time{})
 	if len(data) > maxControlResponse {
@@ -688,9 +786,18 @@ func (c *portalClient) doRequest(ctx context.Context, method string, target *url
 		c.closeControlConnLocked()
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, E.New("GlobalProtect HTTP status: ", resp.Status)
+		statusErr := E.New("GlobalProtect HTTP status: ", resp.Status)
+		if (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && isCredentialSubmissionPath(target.Path) {
+			c.closeControlConnLocked()
+			statusErr = markPermanentRetry(statusErr)
+		}
+		return nil, statusErr
 	}
 	return data, nil
+}
+
+func isCredentialSubmissionPath(requestPath string) bool {
+	return strings.HasSuffix(requestPath, "/global-protect/getconfig.esp") || strings.HasSuffix(requestPath, "/ssl-vpn/login.esp")
 }
 
 func (c *portalClient) requestURL(suffix string) *url.URL {
@@ -770,7 +877,7 @@ func (c *portalClient) getConfig(ctx context.Context, gatewayURL *url.URL, cooki
 	return parseTunnelXML(data, c.options.DisableIPv6)
 }
 
-func (c *portalClient) checkHIP(ctx context.Context, gatewayURL *url.URL, cookie string, config tunnelConfig) (bool, error) {
+func (c *portalClient) checkHIP(ctx context.Context, gatewayURL *url.URL, cookie string, config tunnelConfig, appVersion string) (bool, error) {
 	target := *gatewayURL
 	target.Path = joinURLPath(gatewayURL.Path, "ssl-vpn/hipreportcheck.esp")
 	target.RawQuery = ""
@@ -779,7 +886,24 @@ func (c *portalClient) checkHIP(ctx context.Context, gatewayURL *url.URL, cookie
 	if err != nil {
 		return false, err
 	}
-	return parseHIPCheckXML(data)
+	needed, err := parseHIPCheckXML(data)
+	if err != nil || !needed {
+		return needed, err
+	}
+	report, err := buildHIPReport(cookie, config.Prefixes, c.localHost, c.reportedOS, appVersion)
+	if err != nil {
+		return true, err
+	}
+	target.Path = joinURLPath(gatewayURL.Path, "ssl-vpn/hipreport.esp")
+	submitBody := buildHIPSubmitBody(cookie, config.Prefixes, report)
+	data, err = c.doRequest(ctx, http.MethodPost, &target, "application/x-www-form-urlencoded", []byte(submitBody))
+	if err != nil {
+		return true, err
+	}
+	if err = parseHIPSubmitXML(data); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 func parseHIPCheckXML(content []byte) (bool, error) {
@@ -828,16 +952,24 @@ func (c *portalClient) openTunnel(ctx context.Context, gatewayURL *url.URL, cook
 		requestPath += "?" + target.RawQuery
 	}
 	c.controlMu.Lock()
+	defer c.controlMu.Unlock()
 	conn, responseReader, err := c.ensureControlConnLocked(ctx, &target)
 	if err != nil {
-		c.controlMu.Unlock()
 		return nil, err
 	}
-	deadline := time.Now().Add(30 * time.Second)
-	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
-		deadline = contextDeadline
+	stopContextWatch := prepareControlIO(ctx, conn)
+	contextWatchActive := true
+	defer func() {
+		if contextWatchActive {
+			stopContextWatch()
+		}
+	}()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		stopContextWatch()
+		contextWatchActive = false
+		c.closeControlConnLocked()
+		return nil, ctxErr
 	}
-	_ = conn.SetDeadline(deadline)
 	request := []byte("GET " + requestPath + " HTTP/1.1\r\n\r\n")
 	for len(request) > 0 {
 		written, writeErr := conn.Write(request)
@@ -846,38 +978,39 @@ func (c *portalClient) openTunnel(ctx context.Context, gatewayURL *url.URL, cook
 		}
 		if writeErr != nil {
 			c.closeControlConnLocked()
-			c.controlMu.Unlock()
-			return nil, writeErr
+			return nil, controlContextError(ctx, writeErr)
 		}
 		if written == 0 {
 			c.closeControlConnLocked()
-			c.controlMu.Unlock()
-			return nil, io.ErrShortWrite
+			return nil, controlContextError(ctx, io.ErrShortWrite)
 		}
 	}
 	buf := make([]byte, len("START_TUNNEL"))
 	if _, err = io.ReadFull(responseReader, buf); err != nil {
 		c.closeControlConnLocked()
-		c.controlMu.Unlock()
-		return nil, err
+		return nil, controlContextError(ctx, err)
 	}
 	if string(buf) != "START_TUNNEL" {
 		c.closeControlConnLocked()
-		c.controlMu.Unlock()
 		return nil, E.New("unexpected tunnel handshake: ", string(buf))
+	}
+	stopContextWatch()
+	contextWatchActive = false
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		c.closeControlConnLocked()
+		return nil, ctxErr
 	}
 	_ = conn.SetDeadline(time.Time{})
 	tunnelConn := &bufferedConn{Conn: conn, reader: responseReader}
 	c.controlConn = nil
 	c.controlReader = nil
 	c.controlHost = ""
-	c.controlMu.Unlock()
 	return tunnelConn, nil
 }
 
 func (c *portalClient) chooseGateway(cfg *portalConfig) (*url.URL, error) {
 	if cfg == nil || len(cfg.Gateways) == 0 {
-		return nil, E.New("globalprotect portal has no gateways")
+		return nil, markPermanentRetry(E.New("globalprotect portal has no gateways"))
 	}
 	selected := cfg.Gateways[0]
 	if authGroup := strings.TrimSpace(c.options.AuthGroup); authGroup != "" {
@@ -890,10 +1023,14 @@ func (c *portalClient) chooseGateway(cfg *portalConfig) (*url.URL, error) {
 			}
 		}
 		if !found {
-			return nil, E.New("gateway not found: ", authGroup)
+			return nil, markPermanentRetry(E.New("gateway not found: ", authGroup))
 		}
 	}
-	return parseServerURL(selected.Name, c.options.ServerPort)
+	gatewayURL, err := parseServerURL(selected.Name, c.options.ServerPort)
+	if err != nil {
+		return nil, markPermanentRetry(err)
+	}
+	return gatewayURL, nil
 }
 
 func matchGatewayChoice(choice portalGatewayChoice, authGroup string) bool {
@@ -946,7 +1083,7 @@ func (c *portalClient) obtainPortalSession(ctx context.Context) (*sessionState, 
 		return nil, err
 	}
 	if form.SAMLMethod != "" || form.SAMLRequest != "" || form.InputStr != "" {
-		return nil, E.New("unsupported GlobalProtect challenge flow")
+		return nil, markPermanentRetry(E.New("unsupported GlobalProtect challenge flow"))
 	}
 	cfg, err := c.portalConfig(ctx, form)
 	if err != nil {
@@ -968,15 +1105,16 @@ func (c *portalClient) obtainPortalSession(ctx context.Context) (*sessionState, 
 	if err != nil {
 		return nil, err
 	}
-	if _, err = c.checkHIP(ctx, gatewayURL, cookie, tunnelConfig); err != nil {
+	if _, err = c.checkHIP(ctx, gatewayURL, cookie, tunnelConfig, cfg.AppVersion); err != nil {
 		return nil, err
 	}
 	state := &sessionState{
-		GatewayURL:   gatewayURL,
-		Cookie:       cookie,
-		TunnelURL:    tunnelURL,
-		TunnelConfig: tunnelConfig,
-		AppVersion:   cfg.AppVersion,
+		GatewayURL:       gatewayURL,
+		Cookie:           cookie,
+		TunnelURL:        tunnelURL,
+		TunnelConfig:     tunnelConfig,
+		AppVersion:       cfg.AppVersion,
+		HIPCheckInterval: cfg.HIPCheckInterval,
 	}
 	c.rememberSession(state)
 	return state, nil
@@ -988,7 +1126,7 @@ func (c *portalClient) obtainGatewaySession(ctx context.Context) (*sessionState,
 		return nil, err
 	}
 	if form.SAMLMethod != "" || form.SAMLRequest != "" || form.InputStr != "" {
-		return nil, E.New("unsupported GlobalProtect challenge flow")
+		return nil, markPermanentRetry(E.New("unsupported GlobalProtect challenge flow"))
 	}
 	cookie, err := c.gatewayLogin(ctx, c.baseURL, nil, form)
 	if err != nil {
@@ -1002,15 +1140,16 @@ func (c *portalClient) obtainGatewaySession(ctx context.Context) (*sessionState,
 	if err != nil {
 		return nil, err
 	}
-	if _, err = c.checkHIP(ctx, c.baseURL, cookie, tunnelConfig); err != nil {
+	if _, err = c.checkHIP(ctx, c.baseURL, cookie, tunnelConfig, defaultAppVersion); err != nil {
 		return nil, err
 	}
 	state := &sessionState{
-		GatewayURL:   c.baseURL,
-		Cookie:       cookie,
-		TunnelURL:    tunnelURL,
-		TunnelConfig: tunnelConfig,
-		AppVersion:   defaultAppVersion,
+		GatewayURL:       c.baseURL,
+		Cookie:           cookie,
+		TunnelURL:        tunnelURL,
+		TunnelConfig:     tunnelConfig,
+		AppVersion:       defaultAppVersion,
+		HIPCheckInterval: defaultHIPCheckInterval,
 	}
 	c.rememberSession(state)
 	return state, nil
@@ -1112,6 +1251,8 @@ func parseJSChallenge(content []byte) (*authForm, bool) {
 
 func parseLoginXML(content []byte, localHostname string) (string, error) {
 	type loginXML struct {
+		Status          string `xml:"status,attr"`
+		Error           string `xml:"error"`
 		ApplicationDesc struct {
 			Arguments []string `xml:"argument"`
 		} `xml:"application-desc"`
@@ -1119,6 +1260,14 @@ func parseLoginXML(content []byte, localHostname string) (string, error) {
 	var resp loginXML
 	if err := xml.Unmarshal(content, &resp); err != nil {
 		return "", E.Cause(err, "parse login response")
+	}
+	status := strings.TrimSpace(resp.Status)
+	serverError := strings.TrimSpace(resp.Error)
+	if (status != "" && !strings.EqualFold(status, "success")) || serverError != "" {
+		if serverError == "" {
+			serverError = status
+		}
+		return "", classifyPortalError("GlobalProtect login failed: " + serverError)
 	}
 	specs := []struct {
 		save  bool
@@ -1213,6 +1362,9 @@ func parsePortalXML(content []byte) (*portalConfig, error) {
 		PortalName                   string `xml:"portal-name"`
 		PortalUserAuthCookie         string `xml:"portal-userauthcookie"`
 		PortalPrelogonUserAuthCookie string `xml:"portal-prelogonuserauthcookie"`
+		HIPCollection                struct {
+			ReportInterval string `xml:"hip-report-interval"`
+		} `xml:"hip-collection"`
 	}
 	type portalEnvelopeXML struct {
 		XMLName xml.Name
@@ -1224,12 +1376,12 @@ func parsePortalXML(content []byte) (*portalConfig, error) {
 	if err := xml.Unmarshal(content, &envelope); err != nil {
 		return nil, E.Cause(err, "parse portal response")
 	}
-	if strings.EqualFold(strings.TrimSpace(envelope.Status), "error") {
+	if status := strings.TrimSpace(envelope.Status); status != "" && !strings.EqualFold(status, "success") {
 		message := strings.TrimSpace(envelope.Error)
 		if message == "" {
-			message = "unknown error"
+			message = status
 		}
-		return nil, E.New("GlobalProtect portal error: ", message)
+		return nil, classifyPortalError("GlobalProtect portal error: " + message)
 	}
 	policy := envelope.Policy
 	if envelope.XMLName.Local == "policy" {
@@ -1243,6 +1395,11 @@ func parsePortalXML(content []byte) (*portalConfig, error) {
 		PortalUserAuthCookie:         strings.TrimSpace(policy.PortalUserAuthCookie),
 		PortalPrelogonUserAuthCookie: strings.TrimSpace(policy.PortalPrelogonUserAuthCookie),
 	}
+	hipCheckInterval, err := parseHIPCheckInterval(policy.HIPCollection.ReportInterval)
+	if err != nil {
+		return nil, err
+	}
+	cfg.HIPCheckInterval = hipCheckInterval
 	if cfg.Version == "" {
 		cfg.Version = defaultAppVersion
 	}
@@ -1258,7 +1415,7 @@ func parsePortalXML(content []byte) (*portalConfig, error) {
 		})
 	}
 	if len(cfg.Gateways) == 0 {
-		return nil, E.New("globalprotect portal has no gateways")
+		return nil, markPermanentRetry(E.New("globalprotect portal has no gateways"))
 	}
 	if cfg.PortalUserAuthCookie == "empty" {
 		cfg.PortalUserAuthCookie = ""
@@ -1272,6 +1429,7 @@ func parsePortalXML(content []byte) (*portalConfig, error) {
 func parseTunnelXML(content []byte, disableIPv6 bool) (openconnectIPInfo, string, error) {
 	type tunnelXML struct {
 		Status     string `xml:"status,attr"`
+		Error      string `xml:"error"`
 		IPAddress  string `xml:"ip-address"`
 		Netmask    string `xml:"netmask"`
 		IPAddress6 string `xml:"ip-address-v6"`
@@ -1282,6 +1440,14 @@ func parseTunnelXML(content []byte, disableIPv6 bool) (openconnectIPInfo, string
 	var resp tunnelXML
 	if err := xml.Unmarshal(content, &resp); err != nil {
 		return openconnectIPInfo{}, "", E.Cause(err, "parse tunnel response")
+	}
+	status := strings.TrimSpace(resp.Status)
+	serverError := strings.TrimSpace(resp.Error)
+	if (status != "" && !strings.EqualFold(status, "success")) || serverError != "" {
+		if serverError == "" {
+			serverError = status
+		}
+		return openconnectIPInfo{}, "", E.New("GlobalProtect tunnel configuration failed: ", serverError)
 	}
 	info := openconnectIPInfo{
 		Addr:    strings.TrimSpace(resp.IPAddress),

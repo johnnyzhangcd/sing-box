@@ -7,6 +7,12 @@ icon: material/new-box
     GlobalProtect support requires sing-box to be built with `-tags with_globalprotect,with_gvisor`.
     The implementation is pure Go and does not require `openconnect` or `libopenconnect` at runtime.
     sing-box uses a user-space tunnel together with sing-tun's gVisor stack, so TCP and UDP both work without kernel TUN privileges.
+    Startup is non-blocking: the endpoint connects and retries in the background while other sing-box services become ready.
+    Portal, gateway, and HIP requests use the TLS identity of their actual target unless `sni` explicitly overrides it.
+    When required by the gateway, sing-box submits a HIP report during login and repeats the HIP check at the portal-defined interval.
+
+    The built-in HIP report is a best-effort standard host inventory. Deployments that require a vendor-specific HIP wrapper,
+    custom script, or additional compliance fields can still reject or quarantine the session.
 
 ### Structure
 
@@ -107,7 +113,7 @@ The pure-Go GlobalProtect endpoint always uses TLS/GPST; DTLS and ESP are not im
 
 #### proxy
 
-HTTP or SOCKS proxy URL used for the portal connection.
+SOCKS proxy URL used for GlobalProtect control and tunnel connections.
 
 #### allow_insecure_crypto
 

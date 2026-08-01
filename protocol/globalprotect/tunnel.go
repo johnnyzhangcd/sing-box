@@ -22,7 +22,7 @@ import (
 const (
 	gpstMagic               = 0x1a2b3c4d
 	defaultReconnectTimeout = 5 * time.Minute
-	tunnelReconnectDelay    = 2 * time.Second
+	stableConnectionTime    = 30 * time.Second
 )
 
 type tunnelPacketEndpoint interface {
@@ -51,6 +51,7 @@ type tunnelSession struct {
 	connMu    sync.Mutex
 	conn      net.Conn
 	closed    atomic.Bool
+	connected atomic.Bool
 }
 
 func normalizedReconnectTimeout(timeout time.Duration) time.Duration {
@@ -95,6 +96,7 @@ func (s *tunnelSession) stop() {
 	if s.closed.Swap(true) {
 		return
 	}
+	s.connected.Store(false)
 	s.stateMu.Lock()
 	if !s.started {
 		close(s.done)
@@ -106,6 +108,10 @@ func (s *tunnelSession) stop() {
 	cancel()
 	s.closeConn()
 	<-s.done
+}
+
+func (s *tunnelSession) Ready() bool {
+	return s.connected.Load()
 }
 
 func (s *tunnelSession) setConn(conn net.Conn) {
@@ -135,6 +141,7 @@ func (s *tunnelSession) run(ctx context.Context) {
 	defer close(s.done)
 
 	first := true
+	var backoff retryBackoff
 	for {
 		if ctx.Err() != nil {
 			return
@@ -143,35 +150,55 @@ func (s *tunnelSession) run(ctx context.Context) {
 		conn, err := s.dial(attemptContext)
 		cancelAttempt()
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if isPermanentRetry(err) {
+				if first {
+					s.sendReady(err)
+				}
+				if s.logger != nil {
+					s.logger.Error("GlobalProtect tunnel stopped after a permanent authentication or configuration error: ", err)
+				}
+				return
+			}
+			retryDelay := backoff.Next()
 			if s.logger != nil {
 				if first {
-					s.logger.Warn("GlobalProtect tunnel connection failed; retrying: ", err)
+					s.logger.Warn("GlobalProtect tunnel connection failed; retrying in ", retryDelay, ": ", err)
 				} else {
-					s.logger.Warn("GlobalProtect tunnel reconnect failed; retrying: ", err)
+					s.logger.Warn("GlobalProtect tunnel reconnect failed; retrying in ", retryDelay, ": ", err)
 				}
 			}
-			if !sleepContext(ctx, tunnelReconnectDelay) {
+			if !sleepContext(ctx, retryDelay) {
 				return
 			}
 			continue
 		}
 
 		s.setConn(conn)
+		s.connected.Store(true)
 		if first {
 			s.sendReady(nil)
 			first = false
 		}
 
+		connectedAt := time.Now()
 		err = s.pump(ctx, conn)
+		s.connected.Store(false)
 		_ = conn.Close()
 		s.clearConn(conn)
 		if ctx.Err() != nil {
 			return
 		}
-		if err != nil && s.logger != nil {
-			s.logger.Warn("GlobalProtect tunnel disconnected: ", err)
+		if time.Since(connectedAt) >= stableConnectionTime {
+			backoff.Reset()
 		}
-		if !sleepContext(ctx, tunnelReconnectDelay) {
+		retryDelay := backoff.Next()
+		if err != nil && s.logger != nil {
+			s.logger.Warn("GlobalProtect tunnel disconnected; reconnecting in ", retryDelay, ": ", err)
+		}
+		if !sleepContext(ctx, retryDelay) {
 			return
 		}
 	}

@@ -30,18 +30,25 @@ func RegisterEndpoint(registry *endpoint.Registry) {
 
 type Endpoint struct {
 	endpoint.Adapter
-	ctx       context.Context
-	logger    logger.ContextLogger
-	dnsRouter adapter.DNSRouter
-	options   option.GlobalProtectEndpointOptions
-	client    *portalClient
-	transport tunnelTransport
+	loopContext context.Context
+	cancelLoop  context.CancelFunc
+	logger      logger.ContextLogger
+	dnsRouter   adapter.DNSRouter
+	options     option.GlobalProtectEndpointOptions
+	client      *portalClient
 
-	startOnce sync.Once
-	startErr  error
+	lifecycleAccess sync.Mutex
+	started         bool
+	closed          bool
+	loopDone        chan struct{}
+	closeOnce       sync.Once
+	closeErr        error
+
+	transportAccess sync.RWMutex
+	transport       tunnelTransport
 }
 
-const initialConnectRetryDelay = 2 * time.Second
+const logoutTimeout = 3 * time.Second
 
 func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.GlobalProtectEndpointOptions) (adapter.Endpoint, error) {
 	if options.Server == "" {
@@ -53,83 +60,217 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	if !options.DisableDTLS && logger != nil {
 		logger.Warn("GlobalProtect pure-Go endpoint uses TLS/GPST only; DTLS and ESP are unavailable")
 	}
+	loopContext, cancelLoop := context.WithCancel(ctx)
 	client, err := newPortalClient(ctx, options)
 	if err != nil {
+		cancelLoop()
 		return nil, err
 	}
 	return &Endpoint{
-		Adapter:   endpoint.NewAdapter(Cst.TypeGlobalProtect, tag, []string{N.NetworkTCP, N.NetworkUDP}, nil),
-		ctx:       ctx,
-		logger:    logger,
-		dnsRouter: service.FromContext[adapter.DNSRouter](ctx),
-		options:   options,
-		client:    client,
+		Adapter:     endpoint.NewAdapterWithDialerOptions(Cst.TypeGlobalProtect, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
+		loopContext: loopContext,
+		cancelLoop:  cancelLoop,
+		logger:      logger,
+		dnsRouter:   service.FromContext[adapter.DNSRouter](ctx),
+		options:     options,
+		client:      client,
+		loopDone:    make(chan struct{}),
 	}, nil
 }
 
 func (e *Endpoint) Start(stage adapter.StartStage) error {
-	if stage != adapter.StartStateStart {
+	if stage != adapter.StartStatePostStart {
 		return nil
 	}
-	e.startOnce.Do(func() {
-		e.startErr = e.start()
-	})
-	return e.startErr
+	e.lifecycleAccess.Lock()
+	defer e.lifecycleAccess.Unlock()
+	if e.closed {
+		return net.ErrClosed
+	}
+	if e.started {
+		return nil
+	}
+	e.started = true
+	go e.startLoop()
+	return nil
 }
 
-func (e *Endpoint) start() error {
+func (e *Endpoint) startLoop() {
+	defer close(e.loopDone)
 	reconnectTimeout := normalizedReconnectTimeout(time.Duration(e.options.ReconnectTimeout))
+	var backoff retryBackoff
 	for {
-		attemptContext, cancel := context.WithTimeout(e.ctx, reconnectTimeout)
+		attemptContext, cancel := context.WithTimeout(e.loopContext, reconnectTimeout)
 		state, err := e.client.obtainSession(attemptContext, e.logger)
 		cancel()
 		if err == nil {
-			transport, transportErr := newTunnelTransport(e.ctx, e.logger, e.client, state, reconnectTimeout)
+			transport, transportErr := newTunnelTransport(e.loopContext, e.logger, e.client, state, reconnectTimeout)
 			if transportErr == nil {
+				e.transportAccess.Lock()
+				if e.loopContext.Err() != nil {
+					e.transportAccess.Unlock()
+					_ = transport.Close()
+					return
+				}
 				e.transport = transport
-				return nil
+				e.transportAccess.Unlock()
+				e.periodicHIPLoop(reconnectTimeout)
+				return
 			}
 			err = transportErr
 		}
-		if e.ctx.Err() != nil {
-			return e.ctx.Err()
+		if e.loopContext.Err() != nil {
+			return
 		}
+		if isPermanentRetry(err) {
+			_ = e.client.closeControl()
+			if e.logger != nil {
+				e.logger.Error("GlobalProtect connection stopped after a permanent authentication or configuration error: ", err)
+			}
+			return
+		}
+		retryDelay := backoff.Next()
 		if e.logger != nil {
-			e.logger.Warn("GlobalProtect initial connection failed; retrying: ", err)
+			e.logger.Warn("GlobalProtect initial connection failed; retrying in ", retryDelay, ": ", err)
 		}
-		if !sleepContext(e.ctx, initialConnectRetryDelay) {
-			return e.ctx.Err()
+		if !sleepContext(e.loopContext, retryDelay) {
+			return
+		}
+	}
+}
+
+func (e *Endpoint) periodicHIPLoop(checkTimeout time.Duration) {
+	var retryDelay time.Duration
+	for {
+		state := e.client.session()
+		interval := defaultHIPCheckInterval
+		if state != nil && state.HIPCheckInterval > 0 {
+			interval = state.HIPCheckInterval
+		}
+		delay := interval
+		if retryDelay > 0 && retryDelay < delay {
+			delay = retryDelay
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-e.loopContext.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		case <-e.client.sessionChanges():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			continue
+		case <-timer.C:
+		}
+
+		attemptContext, cancel := context.WithTimeout(e.loopContext, checkTimeout)
+		needed, err := e.client.recheckHIP(attemptContext)
+		cancel()
+		if err != nil {
+			if isPermanentRetry(err) {
+				if e.logger != nil && e.loopContext.Err() == nil {
+					e.logger.Error("GlobalProtect periodic HIP checks stopped after a permanent authentication or configuration error: ", err)
+				}
+				return
+			}
+			retryDelay = min(interval, time.Minute)
+			if e.logger != nil && e.loopContext.Err() == nil {
+				e.logger.Warn("GlobalProtect periodic HIP check failed; retrying: ", err)
+			}
+			continue
+		}
+		retryDelay = 0
+		if needed && e.logger != nil {
+			e.logger.Info("GlobalProtect periodic HIP report submitted")
 		}
 	}
 }
 
 func (e *Endpoint) Close() error {
-	var closeErrors []error
-	if e.transport != nil {
-		if err := e.transport.Close(); err != nil {
-			closeErrors = append(closeErrors, err)
+	e.closeOnce.Do(func() {
+		e.lifecycleAccess.Lock()
+		e.closed = true
+		started := e.started
+		e.cancelLoop()
+		e.lifecycleAccess.Unlock()
+		if started {
+			<-e.loopDone
 		}
-	}
-	if e.client != nil {
-		logoutContext, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		if err := e.client.logout(logoutContext); err != nil {
-			closeErrors = append(closeErrors, err)
-		} else {
-			e.logger.Info("GlobalProtect logout successful")
+
+		var closeErrors []error
+		e.transportAccess.Lock()
+		transport := e.transport
+		e.transport = nil
+		e.transportAccess.Unlock()
+		if transport != nil {
+			if err := transport.Close(); err != nil {
+				closeErrors = append(closeErrors, err)
+			}
 		}
-		cancel()
-	}
-	return errors.Join(closeErrors...)
+		if e.client != nil {
+			logoutContext, cancel := context.WithTimeout(context.Background(), logoutTimeout)
+			if err := e.client.logout(logoutContext); err != nil {
+				closeErrors = append(closeErrors, err)
+			} else if e.logger != nil {
+				e.logger.Info("GlobalProtect logout successful")
+			}
+			cancel()
+		}
+		e.closeErr = errors.Join(closeErrors...)
+	})
+	return e.closeErr
+}
+
+func (e *Endpoint) currentTransport() tunnelTransport {
+	e.transportAccess.RLock()
+	defer e.transportAccess.RUnlock()
+	return e.transport
 }
 
 func (e *Endpoint) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	if e.transport == nil {
+	transport := e.currentTransport()
+	if transport == nil || !transport.Ready() {
 		return nil, E.New("GlobalProtect tunnel is not ready")
 	}
-	switch N.NetworkName(network) {
-	case N.NetworkTCP:
-		e.logger.InfoContext(ctx, "outbound connection to ", destination)
-	case N.NetworkUDP:
+	if e.logger != nil {
+		switch N.NetworkName(network) {
+		case N.NetworkTCP:
+			e.logger.InfoContext(ctx, "outbound connection to ", destination)
+		case N.NetworkUDP:
+			e.logger.InfoContext(ctx, "outbound packet connection to ", destination)
+		}
+	}
+	if destination.IsDomain() {
+		if e.dnsRouter == nil {
+			return nil, E.New("missing DNS router")
+		}
+		destinationAddresses, err := e.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
+		if err != nil {
+			return nil, err
+		}
+		return N.DialSerial(ctx, transport, network, destination, destinationAddresses)
+	}
+	if !destination.Addr.IsValid() {
+		return nil, E.New("invalid destination: ", destination)
+	}
+	return transport.DialContext(ctx, network, destination)
+}
+
+func (e *Endpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	transport := e.currentTransport()
+	if transport == nil || !transport.Ready() {
+		return nil, E.New("GlobalProtect tunnel is not ready")
+	}
+	if e.logger != nil {
 		e.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 	}
 	if destination.IsDomain() {
@@ -140,28 +281,7 @@ func (e *Endpoint) DialContext(ctx context.Context, network string, destination 
 		if err != nil {
 			return nil, err
 		}
-		return N.DialSerial(ctx, e.transport, network, destination, destinationAddresses)
-	}
-	if !destination.Addr.IsValid() {
-		return nil, E.New("invalid destination: ", destination)
-	}
-	return e.transport.DialContext(ctx, network, destination)
-}
-
-func (e *Endpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	if e.transport == nil {
-		return nil, E.New("GlobalProtect tunnel is not ready")
-	}
-	e.logger.InfoContext(ctx, "outbound packet connection to ", destination)
-	if destination.IsDomain() {
-		if e.dnsRouter == nil {
-			return nil, E.New("missing DNS router")
-		}
-		destinationAddresses, err := e.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
-		if err != nil {
-			return nil, err
-		}
-		packetConn, destinationAddress, err := N.ListenSerial(ctx, e.transport, destination, destinationAddresses)
+		packetConn, destinationAddress, err := N.ListenSerial(ctx, transport, destination, destinationAddresses)
 		if err != nil {
 			return nil, err
 		}
@@ -173,5 +293,5 @@ func (e *Endpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	if !destination.Addr.IsValid() {
 		return nil, E.New("invalid destination: ", destination)
 	}
-	return e.transport.ListenPacket(ctx, destination)
+	return transport.ListenPacket(ctx, destination)
 }

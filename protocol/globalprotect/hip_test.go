@@ -54,3 +54,10 @@ func TestParseHIPCheckXML(t *testing.T) {
 		t.Fatal("expected HIP report not to be needed")
 	}
 }
+
+func TestParseHIPSubmitXMLRejectsFailureStatus(t *testing.T) {
+	err := parseHIPSubmitXML([]byte(`<response status="failure"><error>HIP policy rejected</error></response>`))
+	if err == nil {
+		t.Fatal("accepted failed HIP submission")
+	}
+}

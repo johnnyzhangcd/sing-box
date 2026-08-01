@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -149,6 +150,65 @@ func TestTunnelSessionStopClosesConnection(t *testing.T) {
 	}
 }
 
+func TestTunnelSessionReportsDisconnectedState(t *testing.T) {
+	localConn, remoteConn := net.Pipe()
+	defer remoteConn.Close()
+
+	session := newTunnelSession(&blockingTunnelEndpoint{}, func(context.Context) (net.Conn, error) {
+		return localConn, nil
+	}, nil, time.Second, time.Second)
+	ready := session.start(context.Background())
+	select {
+	case err := <-ready:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("session did not become ready")
+	}
+	if !session.Ready() {
+		t.Fatal("session did not publish connected state")
+	}
+	if err := remoteConn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for session.Ready() {
+		select {
+		case <-time.After(5 * time.Millisecond):
+		case <-deadline.C:
+			t.Fatal("session remained ready after tunnel disconnect")
+		}
+	}
+	session.stop()
+}
+
+func TestTunnelSessionStopsAfterPermanentDialFailure(t *testing.T) {
+	var attempts atomic.Int32
+	session := newTunnelSession(&blockingTunnelEndpoint{}, func(context.Context) (net.Conn, error) {
+		attempts.Add(1)
+		return nil, markPermanentRetry(errors.New("invalid credentials"))
+	}, nil, time.Second, time.Second)
+	ready := session.start(context.Background())
+	select {
+	case err := <-ready:
+		if !isPermanentRetry(err) {
+			t.Fatalf("unexpected ready error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("permanent dial failure remained in retry loop")
+	}
+	select {
+	case <-session.done:
+	case <-time.After(time.Second):
+		t.Fatal("session did not stop after permanent dial failure")
+	}
+	if attemptCount := attempts.Load(); attemptCount != 1 {
+		t.Fatalf("permanent dial failure made %d attempts, want 1", attemptCount)
+	}
+}
+
 func TestTunnelSessionStopBeforeStartReturns(t *testing.T) {
 	session := newTunnelSession(&stubTunnelEndpoint{}, func(context.Context) (net.Conn, error) {
 		return nil, context.Canceled
@@ -216,3 +276,12 @@ func (s *stubTunnelEndpoint) ReadContext(context.Context) *stack.PacketBuffer {
 }
 
 func (s *stubTunnelEndpoint) InjectInbound(tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {}
+
+type blockingTunnelEndpoint struct{}
+
+func (s *blockingTunnelEndpoint) ReadContext(ctx context.Context) *stack.PacketBuffer {
+	<-ctx.Done()
+	return nil
+}
+
+func (s *blockingTunnelEndpoint) InjectInbound(tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {}

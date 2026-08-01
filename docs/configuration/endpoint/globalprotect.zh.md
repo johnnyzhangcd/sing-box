@@ -7,6 +7,12 @@ icon: material/new-box
     GlobalProtect 支持需要使用 `-tags with_globalprotect,with_gvisor` 构建的 sing-box。
     该实现是纯 Go 的，运行时不需要 `openconnect` 或 `libopenconnect`。
     sing-box 会使用用户态隧道并接入 sing-tun 的 gVisor stack，因此 TCP 和 UDP 都能工作，而且不需要 kernel TUN 权限。
+    启动过程不会阻塞：端点会在后台连接并重试，其他 sing-box 服务可以先进入就绪状态。
+    门户、网关和 HIP 请求默认使用各自真实目标的 TLS 身份，只有显式设置 `sni` 时才固定覆盖。
+    当网关要求 HIP 时，sing-box 会在登录时提交报告，并按门户下发的周期重新检查。
+
+    内置 HIP 报告提供尽力而为的标准主机信息。如果部署要求厂商专用 HIP wrapper、定制脚本或额外合规字段，
+    网关仍可能拒绝或隔离该会话。
 
 ### 结构
 
@@ -107,7 +113,7 @@ GlobalProtect 门户或网关的主机名。也可以直接提供完整的 `http
 
 #### proxy
 
-用于门户连接的 HTTP 或 SOCKS 代理 URL。
+用于 GlobalProtect 控制连接和隧道连接的 SOCKS 代理 URL。
 
 #### allow_insecure_crypto
 

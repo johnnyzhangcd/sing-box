@@ -28,6 +28,7 @@ import (
 
 type tunnelTransport interface {
 	N.Dialer
+	Ready() bool
 	Close() error
 }
 
@@ -157,6 +158,10 @@ func (t *globalProtectTransport) tunnelAddresses() (netip.Addr, netip.Addr) {
 	return t.inet4Address, t.inet6Address
 }
 
+func (t *globalProtectTransport) Ready() bool {
+	return t.session != nil && t.session.Ready()
+}
+
 func (t *globalProtectTransport) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	if !destination.Addr.IsValid() {
 		return nil, E.New("invalid destination: ", destination)
@@ -245,6 +250,7 @@ func (t *globalProtectTransport) Close() error {
 			for _, endpoint := range t.stack.CleanupEndpoints() {
 				endpoint.Abort()
 			}
+			t.stack.Wait()
 		}
 		if t.linkedEndpoint != nil {
 			t.linkedEndpoint.Close()

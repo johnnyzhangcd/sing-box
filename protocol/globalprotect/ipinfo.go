@@ -1,5 +1,3 @@
-//go:build with_globalprotect
-
 package globalprotect
 
 import (

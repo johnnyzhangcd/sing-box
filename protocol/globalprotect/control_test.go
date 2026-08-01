@@ -11,13 +11,13 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
-	"net/netip"
+	"net"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
-	"github.com/miekg/dns"
-	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/option"
 )
 
@@ -60,6 +60,57 @@ func TestAllowInsecureCryptoEnablesLegacySuites(t *testing.T) {
 	if _, exists := enabled[legacySuites[0].ID]; !exists {
 		t.Fatal("allow_insecure_crypto did not enable legacy cipher suites")
 	}
+}
+
+func TestPrepareControlIOSetsCancellationDeadlineLast(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	recorded := &deadlineRecordingConn{
+		Conn:      left,
+		immediate: make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	started := time.Now()
+	stop := prepareControlIO(ctx, recorded)
+	select {
+	case <-recorded.immediate:
+	case <-time.After(time.Second):
+		t.Fatal("cancellation watcher did not force an immediate deadline")
+	}
+	stop()
+
+	recorded.mu.Lock()
+	deadlines := append([]time.Time(nil), recorded.deadlines...)
+	recorded.mu.Unlock()
+	if len(deadlines) < 2 {
+		t.Fatalf("recorded %d deadlines, want normal then cancellation", len(deadlines))
+	}
+	if !deadlines[0].After(started.Add(20 * time.Second)) {
+		t.Fatalf("first deadline was not the normal control deadline: %s", deadlines[0])
+	}
+	if deadlines[len(deadlines)-1].After(time.Now().Add(time.Second)) {
+		t.Fatalf("normal deadline overwrote cancellation deadline: %s", deadlines[len(deadlines)-1])
+	}
+}
+
+type deadlineRecordingConn struct {
+	net.Conn
+	mu            sync.Mutex
+	deadlines     []time.Time
+	immediateOnce sync.Once
+	immediate     chan struct{}
+}
+
+func (c *deadlineRecordingConn) SetDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	c.deadlines = append(c.deadlines, deadline)
+	c.mu.Unlock()
+	if deadline.Before(time.Now().Add(time.Second)) {
+		c.immediateOnce.Do(func() { close(c.immediate) })
+	}
+	return c.Conn.SetDeadline(deadline)
 }
 
 func TestVerifyPinnedCertificateMatchesOpenConnectFormats(t *testing.T) {
@@ -107,6 +158,26 @@ func TestBuildLoginBodyIncludesServerIdentity(t *testing.T) {
 	}
 	if got := values.Get("computer"); got != "host-01" {
 		t.Fatalf("unexpected computer identity: %q", got)
+	}
+}
+
+func TestCredentialSubmissionPathClassification(t *testing.T) {
+	for _, requestPath := range []string{
+		"/global-protect/getconfig.esp",
+		"/prefix/ssl-vpn/login.esp",
+	} {
+		if !isCredentialSubmissionPath(requestPath) {
+			t.Fatalf("credential submission path was not classified: %s", requestPath)
+		}
+	}
+	for _, requestPath := range []string{
+		"/ssl-vpn/hipreportcheck.esp",
+		"/ssl-vpn/getconfig.esp",
+		"/global-protect/prelogin.esp",
+	} {
+		if isCredentialSubmissionPath(requestPath) {
+			t.Fatalf("non-credential path was classified as credential submission: %s", requestPath)
+		}
 	}
 }
 
@@ -171,6 +242,27 @@ func TestParsePreloginXMLPortalUnavailable(t *testing.T) {
 	_, err := parsePreloginXML([]byte(`<prelogin-response><status>Error</status><msg>GlobalProtect portal does not exist</msg></prelogin-response>`))
 	if !errors.Is(err, errPortalUnavailable) {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestParsePreloginXMLInvalidCredentialsIsPermanent(t *testing.T) {
+	_, err := parsePreloginXML([]byte(`<prelogin-response><status>Error</status><msg>Invalid username or password</msg></prelogin-response>`))
+	if !isPermanentRetry(err) {
+		t.Fatalf("invalid credentials were treated as retryable: %v", err)
+	}
+}
+
+func TestParsePreloginXMLInvalidCredentialsWithTryAgainIsPermanent(t *testing.T) {
+	_, err := parsePreloginXML([]byte(`<prelogin-response><status>Error</status><msg>Invalid username or password. Please try again.</msg></prelogin-response>`))
+	if !isPermanentRetry(err) {
+		t.Fatalf("credential rejection with try-again text was treated as retryable: %v", err)
+	}
+}
+
+func TestParsePreloginXMLTemporarilyLockedAccountIsPermanent(t *testing.T) {
+	_, err := parsePreloginXML([]byte(`<prelogin-response><status>Error</status><msg>Account temporarily locked</msg></prelogin-response>`))
+	if !isPermanentRetry(err) {
+		t.Fatalf("temporarily locked account was treated as retryable: %v", err)
 	}
 }
 
@@ -262,6 +354,23 @@ func TestParseLoginXML(t *testing.T) {
 	}
 }
 
+func TestParseLoginXMLRejectsAuthenticationFailure(t *testing.T) {
+	_, err := parseLoginXML([]byte(`<response status="error"><error>Authentication failed</error></response>`), "host-01")
+	if !isPermanentRetry(err) {
+		t.Fatalf("login rejection was treated as retryable: %v", err)
+	}
+}
+
+func TestParseLoginXMLTemporaryFailureIsRetryable(t *testing.T) {
+	_, err := parseLoginXML([]byte(`<response status="error"><error>Authentication failed: service temporarily unavailable</error></response>`), "host-01")
+	if err == nil {
+		t.Fatal("accepted temporary login failure")
+	}
+	if isPermanentRetry(err) {
+		t.Fatalf("temporary login failure was treated as permanent: %v", err)
+	}
+}
+
 func TestParsePortalXML(t *testing.T) {
 	cfg, err := parsePortalXML([]byte(`
 <policy>
@@ -300,11 +409,42 @@ func TestParsePortalXML(t *testing.T) {
 	if cfg.PortalPrelogonUserAuthCookie != "cookie-b" {
 		t.Fatalf("unexpected prelogon cookie: %q", cfg.PortalPrelogonUserAuthCookie)
 	}
+	if cfg.HIPCheckInterval != 59*time.Minute {
+		t.Fatalf("unexpected HIP check interval: %s", cfg.HIPCheckInterval)
+	}
 	if len(cfg.Gateways) != 2 {
 		t.Fatalf("unexpected gateway count: %d", len(cfg.Gateways))
 	}
 	if cfg.Gateways[0].Name != "gw-a.example.com" || cfg.Gateways[0].Description != "Primary" {
 		t.Fatalf("unexpected first gateway: %#v", cfg.Gateways[0])
+	}
+}
+
+func TestParsePortalXMLInvalidCredentialsIsPermanent(t *testing.T) {
+	_, err := parsePortalXML([]byte(`<response status="error"><error>Invalid username or password</error></response>`))
+	if !isPermanentRetry(err) {
+		t.Fatalf("portal login rejection was treated as retryable: %v", err)
+	}
+}
+
+func TestParsePortalXMLWithoutGatewaysIsPermanent(t *testing.T) {
+	_, err := parsePortalXML([]byte(`<policy><gateways><external><list/></external></gateways></policy>`))
+	if !isPermanentRetry(err) {
+		t.Fatalf("empty gateway policy was treated as retryable: %v", err)
+	}
+}
+
+func TestChooseGatewayMissingAuthGroupIsPermanent(t *testing.T) {
+	client, err := newPortalClient(context.Background(), option.GlobalProtectEndpointOptions{
+		ServerOptions: option.ServerOptions{Server: "portal.example.com"},
+		AuthGroup:     "missing-group",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.chooseGateway(&portalConfig{Gateways: []portalGatewayChoice{{Name: "gateway.example.com"}}})
+	if !isPermanentRetry(err) {
+		t.Fatalf("missing auth group was treated as retryable: %v", err)
 	}
 }
 
@@ -341,6 +481,13 @@ func TestParseTunnelXML(t *testing.T) {
 	}
 }
 
+func TestParseTunnelXMLRejectsFailureStatus(t *testing.T) {
+	_, _, err := parseTunnelXML([]byte(`<response status="failure"><error>Invalid tunnel cookie</error></response>`), false)
+	if err == nil || !strings.Contains(err.Error(), "Invalid tunnel cookie") {
+		t.Fatalf("unexpected tunnel failure result: %v", err)
+	}
+}
+
 func TestLogicalServerURLUsesSNIForConfiguredIP(t *testing.T) {
 	base := mustURL(t, "https://192.0.2.10:1235")
 	got := logicalServerURL(base, "vpn.example.com")
@@ -368,53 +515,3 @@ func TestPinnedControlAddressUsesConfiguredIPForSNI(t *testing.T) {
 		t.Fatal("unexpected pin for unrelated host")
 	}
 }
-
-func TestResolveDialTargetUsesDNSRouter(t *testing.T) {
-	router := &stubDNSRouter{
-		addresses: []netip.Addr{
-			netip.MustParseAddr("203.0.113.10"),
-			netip.MustParseAddr("2001:db8::10"),
-		},
-	}
-
-	destination, err := resolveDialTarget(context.Background(), "tcp4", "portal.example.com:1235", router)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := destination.Addr.String(); got != "203.0.113.10" {
-		t.Fatalf("unexpected address: %s", got)
-	}
-	if destination.Port != 1235 {
-		t.Fatalf("unexpected port: %d", destination.Port)
-	}
-	if router.calls != 1 {
-		t.Fatalf("unexpected lookup calls: %d", router.calls)
-	}
-}
-
-type stubDNSRouter struct {
-	adapter.DNSRouter
-	addresses []netip.Addr
-	calls     int
-}
-
-func (s *stubDNSRouter) Start(adapter.StartStage) error { return nil }
-
-func (s *stubDNSRouter) Close() error { return nil }
-
-func (s *stubDNSRouter) Lookup(context.Context, string, adapter.DNSQueryOptions) ([]netip.Addr, error) {
-	s.calls++
-	return s.addresses, nil
-}
-
-func (s *stubDNSRouter) Exchange(context.Context, *dns.Msg, adapter.DNSQueryOptions) (*dns.Msg, error) {
-	return nil, nil
-}
-
-func (s *stubDNSRouter) ClearCache() {}
-
-func (s *stubDNSRouter) LookupReverseMapping(netip.Addr) (string, bool) {
-	return "", false
-}
-
-func (s *stubDNSRouter) ResetNetwork() {}

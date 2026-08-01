@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"runtime"
 	"strings"
+	"time"
 )
 
 const (
@@ -35,6 +36,7 @@ type portalConfig struct {
 	PortalPrelogonUserAuthCookie string
 	Gateways                     []portalGatewayChoice
 	AppVersion                   string
+	HIPCheckInterval             time.Duration
 }
 
 type queryBuilder struct {
