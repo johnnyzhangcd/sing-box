@@ -42,16 +42,18 @@ type tunnelSession struct {
 	keepalive        time.Duration
 	reconnectTimeout time.Duration
 
-	startOnce sync.Once
-	stateMu   sync.Mutex
-	started   bool
-	ready     chan error
-	cancel    context.CancelFunc
-	done      chan struct{}
-	connMu    sync.Mutex
-	conn      net.Conn
-	closed    atomic.Bool
-	connected atomic.Bool
+	startOnce    sync.Once
+	stateMu      sync.Mutex
+	started      bool
+	ready        chan error
+	cancel       context.CancelFunc
+	done         chan struct{}
+	stateChanged chan struct{}
+	terminalErr  error
+	connMu       sync.Mutex
+	conn         net.Conn
+	closed       atomic.Bool
+	connected    atomic.Bool
 }
 
 func normalizedReconnectTimeout(timeout time.Duration) time.Duration {
@@ -73,6 +75,7 @@ func newTunnelSession(endpoint tunnelPacketEndpoint, dial func(context.Context) 
 		reconnectTimeout: normalizedReconnectTimeout(reconnectTimeout),
 		ready:            make(chan error, 1),
 		done:             make(chan struct{}),
+		stateChanged:     make(chan struct{}),
 	}
 }
 
@@ -96,7 +99,7 @@ func (s *tunnelSession) stop() {
 	if s.closed.Swap(true) {
 		return
 	}
-	s.connected.Store(false)
+	s.publishState(false, net.ErrClosed)
 	s.stateMu.Lock()
 	if !s.started {
 		close(s.done)
@@ -112,6 +115,38 @@ func (s *tunnelSession) stop() {
 
 func (s *tunnelSession) Ready() bool {
 	return s.connected.Load()
+}
+
+func (s *tunnelSession) WaitReady(ctx context.Context) error {
+	for {
+		s.stateMu.Lock()
+		connected := s.connected.Load()
+		terminalErr := s.terminalErr
+		stateChanged := s.stateChanged
+		s.stateMu.Unlock()
+		if connected {
+			return nil
+		}
+		if terminalErr != nil {
+			return terminalErr
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-stateChanged:
+		}
+	}
+}
+
+func (s *tunnelSession) publishState(connected bool, terminalErr error) {
+	s.stateMu.Lock()
+	s.connected.Store(connected)
+	if terminalErr != nil && s.terminalErr == nil {
+		s.terminalErr = terminalErr
+	}
+	close(s.stateChanged)
+	s.stateChanged = make(chan struct{})
+	s.stateMu.Unlock()
 }
 
 func (s *tunnelSession) setConn(conn net.Conn) {
@@ -138,7 +173,17 @@ func (s *tunnelSession) closeConn() {
 }
 
 func (s *tunnelSession) run(ctx context.Context) {
-	defer close(s.done)
+	var terminalErr error
+	defer func() {
+		if terminalErr == nil {
+			terminalErr = ctx.Err()
+		}
+		if terminalErr == nil {
+			terminalErr = net.ErrClosed
+		}
+		s.publishState(false, terminalErr)
+		close(s.done)
+	}()
 
 	first := true
 	var backoff retryBackoff
@@ -154,6 +199,7 @@ func (s *tunnelSession) run(ctx context.Context) {
 				return
 			}
 			if isPermanentRetry(err) {
+				terminalErr = err
 				if first {
 					s.sendReady(err)
 				}
@@ -177,7 +223,7 @@ func (s *tunnelSession) run(ctx context.Context) {
 		}
 
 		s.setConn(conn)
-		s.connected.Store(true)
+		s.publishState(true, nil)
 		if first {
 			s.sendReady(nil)
 			first = false
@@ -185,7 +231,7 @@ func (s *tunnelSession) run(ctx context.Context) {
 
 		connectedAt := time.Now()
 		err = s.pump(ctx, conn)
-		s.connected.Store(false)
+		s.publishState(false, nil)
 		_ = conn.Close()
 		s.clearConn(conn)
 		if ctx.Err() != nil {

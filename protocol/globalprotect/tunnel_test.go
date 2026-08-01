@@ -184,6 +184,66 @@ func TestTunnelSessionReportsDisconnectedState(t *testing.T) {
 	session.stop()
 }
 
+func TestTunnelSessionWaitReadyHonorsContextDuringReconnect(t *testing.T) {
+	firstLocal, firstRemote := net.Pipe()
+	defer firstRemote.Close()
+	secondLocal, secondRemote := net.Pipe()
+	defer secondRemote.Close()
+
+	allowReconnect := make(chan struct{})
+	var attempts atomic.Int32
+	session := newTunnelSession(&blockingTunnelEndpoint{}, func(ctx context.Context) (net.Conn, error) {
+		if attempts.Add(1) == 1 {
+			return firstLocal, nil
+		}
+		select {
+		case <-allowReconnect:
+			return secondLocal, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}, nil, time.Second, time.Second)
+	ready := session.start(context.Background())
+	select {
+	case err := <-ready:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("session did not become ready")
+	}
+
+	if err := firstRemote.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for session.Ready() {
+		select {
+		case <-time.After(5 * time.Millisecond):
+		case <-deadline.C:
+			t.Fatal("session remained ready after tunnel disconnect")
+		}
+	}
+
+	waitContext, cancelWait := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancelWait()
+	if err := session.WaitReady(waitContext); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wait during reconnect returned %v, want context deadline exceeded", err)
+	}
+
+	close(allowReconnect)
+	recoveredContext, cancelRecovered := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancelRecovered()
+	if err := session.WaitReady(recoveredContext); err != nil {
+		t.Fatalf("wait for recovered tunnel: %v", err)
+	}
+	if !session.Ready() {
+		t.Fatal("session did not publish recovered state")
+	}
+	session.stop()
+}
+
 func TestTunnelSessionStopsAfterPermanentDialFailure(t *testing.T) {
 	var attempts atomic.Int32
 	session := newTunnelSession(&blockingTunnelEndpoint{}, func(context.Context) (net.Conn, error) {

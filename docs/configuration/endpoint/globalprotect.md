@@ -7,7 +7,8 @@ icon: material/new-box
     GlobalProtect support requires sing-box to be built with `-tags with_globalprotect,with_gvisor`.
     The implementation is pure Go and does not require `openconnect` or `libopenconnect` at runtime.
     sing-box uses a user-space tunnel together with sing-tun's gVisor stack, so TCP and UDP both work without kernel TUN privileges.
-    Startup is non-blocking: the endpoint connects and retries in the background while other sing-box services become ready.
+    Startup is non-blocking by default: the endpoint connects and retries in the background while other sing-box services become ready.
+    Enable `wait_for_ready` when a TUN inbound routes system traffic or DNS through this endpoint.
     Portal, gateway, and HIP requests use the TLS identity of their actual target unless `sni` explicitly overrides it.
     When required by the gateway, sing-box submits a HIP report during login and repeats the HIP check at the portal-defined interval.
 
@@ -37,6 +38,7 @@ icon: material/new-box
   "proxy": "",
   "allow_insecure_crypto": false,
   "pfs": false,
+  "wait_for_ready": false,
   "reconnect_timeout": "5m",
 
   ... // Dial Fields
@@ -125,6 +127,15 @@ Allow legacy crypto, including SHA1, 3DES, and RC4.
 #### pfs
 
 Require Perfect Forward Secrecy for the TLS channel.
+
+#### wait_for_ready
+
+Wait for the first GlobalProtect tunnel connection before starting sing-box inbounds.
+
+When enabled, new outbound connections also wait for an in-progress tunnel reconnection and honor the caller's context timeout.
+Enable this for a TUN inbound whose default route or DNS transport uses the GlobalProtect endpoint, so the TUN does not accept traffic before the tunnel is ready.
+
+Disabled by default to preserve non-blocking startup for SOCKS and mixed inbounds.
 
 #### reconnect_timeout
 

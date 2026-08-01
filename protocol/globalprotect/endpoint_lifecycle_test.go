@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/json"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/service"
 )
@@ -51,6 +53,82 @@ func TestEndpointStartupDoesNotWaitForUnavailableGateway(t *testing.T) {
 	_, err = endpoint.DialContext(context.Background(), "tcp", M.ParseSocksaddr("192.0.2.1:443"))
 	if err == nil || !strings.Contains(err.Error(), "not ready") {
 		t.Fatalf("expected an explicit not-ready error, got %v", err)
+	}
+}
+
+func TestEndpointWaitForReadyBlocksStartupUntilContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var options option.GlobalProtectEndpointOptions
+	if err := json.Unmarshal([]byte(`{"server":"127.0.0.1:1","username":"test-user","wait_for_ready":true}`), &options); err != nil {
+		t.Fatal(err)
+	}
+	created, err := NewEndpoint(ctx, nil, log.NewNOPFactory().NewLogger("globalprotect-wait-test"), "gp-test", options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := created.(*Endpoint)
+	defer endpoint.Close()
+
+	started := make(chan error, 1)
+	go func() {
+		started <- endpoint.Start(adapter.StartStateStart)
+	}()
+
+	select {
+	case err = <-started:
+		t.Fatalf("wait-for-ready startup returned before the gateway became ready: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	cancel()
+	select {
+	case err = <-started:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("wait-for-ready startup returned %v after cancellation, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("wait-for-ready startup did not stop after context cancellation")
+	}
+}
+
+func TestEndpointWaitForReadyDialHonorsContext(t *testing.T) {
+	endpointContext, cancelEndpoint := context.WithCancel(context.Background())
+	defer cancelEndpoint()
+
+	var options option.GlobalProtectEndpointOptions
+	if err := json.Unmarshal([]byte(`{"server":"127.0.0.1:1","username":"test-user","wait_for_ready":true}`), &options); err != nil {
+		t.Fatal(err)
+	}
+	created, err := NewEndpoint(endpointContext, nil, log.NewNOPFactory().NewLogger("globalprotect-wait-dial-test"), "gp-test", options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := created.(*Endpoint)
+	defer endpoint.Close()
+
+	started := make(chan error, 1)
+	go func() {
+		started <- endpoint.Start(adapter.StartStateStart)
+	}()
+
+	dialContext, cancelDial := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancelDial()
+	startTime := time.Now()
+	_, err = endpoint.DialContext(dialContext, "tcp", M.ParseSocksaddr("192.0.2.1:443"))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wait-for-ready dial returned %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(startTime); elapsed < 80*time.Millisecond {
+		t.Fatalf("wait-for-ready dial returned too early after %v", elapsed)
+	}
+
+	cancelEndpoint()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("wait-for-ready startup did not stop after endpoint cancellation")
 	}
 }
 

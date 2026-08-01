@@ -7,7 +7,8 @@ icon: material/new-box
     GlobalProtect 支持需要使用 `-tags with_globalprotect,with_gvisor` 构建的 sing-box。
     该实现是纯 Go 的，运行时不需要 `openconnect` 或 `libopenconnect`。
     sing-box 会使用用户态隧道并接入 sing-tun 的 gVisor stack，因此 TCP 和 UDP 都能工作，而且不需要 kernel TUN 权限。
-    启动过程不会阻塞：端点会在后台连接并重试，其他 sing-box 服务可以先进入就绪状态。
+    默认启动过程不会阻塞：端点会在后台连接并重试，其他 sing-box 服务可以先进入就绪状态。
+    当 TUN 入站通过此端点转发系统流量或 DNS 时，请启用 `wait_for_ready`。
     门户、网关和 HIP 请求默认使用各自真实目标的 TLS 身份，只有显式设置 `sni` 时才固定覆盖。
     当网关要求 HIP 时，sing-box 会在登录时提交报告，并按门户下发的周期重新检查。
 
@@ -37,6 +38,7 @@ icon: material/new-box
   "proxy": "",
   "allow_insecure_crypto": false,
   "pfs": false,
+  "wait_for_ready": false,
   "reconnect_timeout": "5m",
 
   ... // 拨号字段
@@ -125,6 +127,15 @@ GlobalProtect 门户或网关的主机名。也可以直接提供完整的 `http
 #### pfs
 
 要求 TLS 通道使用 Perfect Forward Secrecy。
+
+#### wait_for_ready
+
+首次 GlobalProtect 隧道连接成功后，才继续启动 sing-box 的入站。
+
+启用后，新建出站连接也会在隧道重连期间等待，并遵守调用方 context 的超时。
+当 TUN 入站的默认路由或 DNS transport 使用 GlobalProtect 端点时应启用此项，避免 TUN 在隧道就绪前接收流量。
+
+默认关闭，以保持 SOCKS 和 mixed 入站的非阻塞启动兼容性。
 
 #### reconnect_timeout
 

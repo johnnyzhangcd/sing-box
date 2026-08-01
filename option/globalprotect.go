@@ -21,5 +21,6 @@ type GlobalProtectEndpointOptions struct {
 	Proxy               string             `json:"proxy,omitempty"`
 	AllowInsecureCrypto bool               `json:"allow_insecure_crypto,omitempty"`
 	PFS                 bool               `json:"pfs,omitempty"`
+	WaitForReady        bool               `json:"wait_for_ready,omitempty"`
 	ReconnectTimeout    badoption.Duration `json:"reconnect_timeout,omitempty"`
 }

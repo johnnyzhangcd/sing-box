@@ -339,8 +339,8 @@
     </section>
 
     <section aria-labelledby="data-title">
-      <h2 id="data-title">数据面：标准 endpoint，不碰系统路由</h2>
-      <p class="section-intro">应用把流量交给 sing-box；GlobalProtect endpoint 只在进程内部维护一套用户态网络栈。宿主机看到的唯一外部连接是到网关的 TLS 会话。</p>
+      <h2 id="data-title">数据面：标准 endpoint，可接 mixed 或系统 TUN</h2>
+      <p class="section-intro">应用或系统 TUN 把流量交给 sing-box；GlobalProtect endpoint 在进程内部维护一套用户态网络栈。宿主机看到的唯一外部 VPN 连接是到网关的 TLS 会话。</p>
       <div class="flow" aria-label="数据流步骤">
         <div class="flow-node"><strong>1. Inbound</strong><small>SOCKS / mixed 接收 TCP 与 UDP</small></div>
         <div class="flow-node"><strong>2. Route</strong><small>按 tag 选择 GlobalProtect endpoint</small></div>
@@ -348,15 +348,15 @@
         <div class="flow-node"><strong>4. GPST</strong><small>添加 16-byte header 与 keepalive</small></div>
         <div class="flow-node"><strong>5. Gateway</strong><small>经 TLS 隧道收发 IP packet</small></div>
       </div>
-      <div class="callout"><strong>网络边界：</strong>测试服务只监听 VM 的 <code>127.0.0.1</code>；未创建 kernel TUN，未改默认路由、iptables、宿主机代理或本机网络。</div>
+      <div class="callout"><strong>网络边界：</strong>mixed 测试仍只监听 VM 的 <code>127.0.0.1</code>；TUN 测试在专用 VM 上临时创建接口和策略路由，保留 LAN 管理网段，退出后确认接口、防火墙规则与 IPv4/IPv6 策略路由均已清理。</div>
     </section>
 
     <section aria-labelledby="life-title">
       <h2 id="life-title">生命周期与恢复策略</h2>
       <div class="timeline">
-        <article class="event"><h3>PostStart 立即返回</h3><p>连接循环在后台运行，sing-box 其他 inbound 不再等待远端 VPN。隧道未就绪时返回清晰的 <code>GlobalProtect tunnel is not ready</code>。</p></article>
+        <article class="event"><h3>两种启动模式</h3><p>默认仍在 PostStart 后台连接，适合 SOCKS / mixed。启用 <code>wait_for_ready</code> 后在 Start 阶段等待首次隧道 ready，成功后才启动 TUN 等 inbound；永久错误直接终止启动，取消操作可立即唤醒。</p></article>
         <article class="event"><h3>首次连接失败</h3><p>每次尝试受 <code>reconnect_timeout</code> 约束；瞬态错误从约 2 秒起指数退避并加入抖动，永久认证/证书错误会停止自动重试，避免账号锁定和请求风暴。</p></article>
-        <article class="event"><h3>运行中断线</h3><p>先尝试复用当前 session；若恢复失败，再重新认证并原子刷新地址与 MTU。gVisor stack 保持存在，应用侧连接可继续重建。</p></article>
+        <article class="event"><h3>运行中断线</h3><p>先尝试复用当前 session；若恢复失败，再重新认证并原子刷新地址与 MTU。启用 <code>wait_for_ready</code> 时，新拨号按调用方 context 等待重连；默认模式仍快速返回 not-ready，保持兼容。</p></article>
         <article class="event"><h3>周期 HIP</h3><p>隧道就绪后独立计时；检查失败最多 1 分钟后重试，成功后恢复 Portal 指定周期。</p></article>
         <article class="event"><h3>Close</h3><p>取消后台 context、等待循环退出、关闭 transport，再以独立超时执行 logout；重复调用安全。</p></article>
       </div>
@@ -370,12 +370,13 @@
           <tbody>
             <tr><td>默认构建失败</td><td><code>ipinfo.go</code> 的 build tag 与调用方不一致</td><td>让协议数据类型参与默认构建</td><td><strong>无 tag 包测试通过</strong></td></tr>
             <tr><td>启动被远端阻塞</td><td>PostStart 同步完成认证和建隧道</td><td>可取消的后台生命周期与显式 readiness</td><td><strong>不可达网关下 0.02s 启动</strong></td></tr>
+            <tr><td>TUN 首包 DNS 失败</td><td>后台 GP 尚未 ready，系统 TUN 已开始接收流量</td><td><code>wait_for_ready</code> 在 inbound 前建立首次隧道，并让拨号在重连期可取消地等待</td><td><strong>真实 TUN 首包 DNS 与 HTTPS 通过</strong></td></tr>
             <tr><td>Dial Fields 无效</td><td>控制面使用独立 <code>net.Dialer</code></td><td>复用 sing-box 标准 dialer 与依赖声明</td><td><strong>真实源地址绑定测试通过</strong></td></tr>
             <tr><td>Portal→Gateway 证书错误</td><td>TLS ServerName 被固定为 Portal</td><td>按每个 control target 构造 TLS identity</td><td><strong>真实 TLS ClientHello 验证</strong></td></tr>
             <tr><td>HIP required 被忽略</td><td>只解析 needed，没有提交 report</td><td>报告构造、提交、响应校验和周期重检</td><td><strong>真实 HTTPS 交互测试通过</strong></td></tr>
             <tr><td>Close 可能被控制面读阻塞</td><td>阻塞 I/O 没有被 context 取消唤醒</td><td>先设置正常 deadline，再安装取消 watcher，并同步完成 handoff</td><td><strong>stalled TLS 与 race 测试通过</strong></td></tr>
             <tr><td>错误重试可能形成请求风暴</td><td>永久凭据/配置错误与瞬态后端错误未区分</td><td>类型化永久错误；瞬态错误指数退避、上限与抖动；锁定账号优先停止</td><td><strong>组合错误与单次停止测试通过</strong></td></tr>
-            <tr><td>断线后仍显示 ready</td><td>连接状态没有随 transport 原子失效</td><td>session readiness 原子切换，重连期间快速拒绝新连接</td><td><strong>10 / 10 请求约 20ms 内失败</strong></td></tr>
+            <tr><td>断线后仍显示 ready</td><td>连接状态没有随 transport 原子失效</td><td>session readiness 原子切换；默认快速拒绝，TUN 等待模式按 context 等待恢复</td><td><strong>断线 DNS 保持等待并在恢复后成功</strong></td></tr>
             <tr><td>资源与 HIP 周期边界</td><td>gVisor 未等待退出，HIP interval 更新不能重置 timer</td><td><code>CleanupEndpoints → Abort → Wait</code>，并让 timer 响应 session 更新</td><td><strong>重复 HIP、shuffle 与 race 通过</strong></td></tr>
           </tbody>
         </table>
@@ -389,7 +390,10 @@
         <table>
           <thead><tr><th>场景</th><th>结果</th><th>观察</th></tr></thead>
           <tbody>
-            <tr><td>真实启动</td><td><strong>通过</strong></td><td>主服务 0.03s 就绪，隧道随后异步就绪</td></tr>
+            <tr><td>mixed 真实启动</td><td><strong>通过</strong></td><td>主服务 0.03s 就绪，隧道随后异步就绪</td></tr>
+            <tr><td>TUN ready 屏障</td><td><strong>通过</strong></td><td>GP 地址先出现，TUN 后启动；首条 YouTube DNS 返回 142.251.*，HTTPS 200</td></tr>
+            <tr><td>TUN 断线恢复</td><td><strong>通过</strong></td><td>阻断并关闭 GPST 后 DNS 保持等待；解除阻断后自动重连并成功返回</td></tr>
+            <tr><td>localCN 分流</td><td><strong>通过</strong></td><td>YouTube 经 GlobalProtect、百度经 direct，DNS 与 HTTPS 均成功</td></tr>
             <tr><td>20 路并发 HTTPS</td><td><strong>20 / 20</strong></td><td>平均 0.480s，最大 0.544s</td></tr>
             <tr><td>5 × 25 MB 并发下载</td><td><strong>125 MB 完成</strong></td><td>最终候选聚合 84.07 Mbps；前序候选为 100–104 Mbps</td></tr>
             <tr><td>SOCKS5 UDP DNS</td><td><strong>通过</strong></td><td>rcode=0，返回 8 个 answer</td></tr>
@@ -404,7 +408,7 @@
 
     <section aria-labelledby="run-title">
       <h2 id="run-title">构建与最小配置</h2>
-      <p class="section-intro">GlobalProtect 与 gVisor 是显式构建特性。下面的示例不会创建系统 TUN；将 mixed inbound 绑定在回环地址即可保持隔离。平台标识会自动检测，macOS 在 Intel 与 Apple Silicon 上都会按协议要求报告为 <code>mac-intel</code>。</p>
+      <p class="section-intro">GlobalProtect 与 gVisor 是显式构建特性。下面的 mixed 示例不会创建系统 TUN；系统 TUN 配置应在 endpoint 中增加 <code>"wait_for_ready": true</code>。平台标识会自动检测，macOS 在 Intel 与 Apple Silicon 上都会按协议要求报告为 <code>mac-intel</code>。</p>
       <pre><code>CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
   go build -tags "with_globalprotect,with_gvisor" \
   -o sing-box-globalprotect ./cmd/sing-box</code></pre>

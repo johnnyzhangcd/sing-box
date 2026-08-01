@@ -29,6 +29,7 @@ import (
 type tunnelTransport interface {
 	N.Dialer
 	Ready() bool
+	WaitReady(ctx context.Context) error
 	Close() error
 }
 
@@ -160,6 +161,13 @@ func (t *globalProtectTransport) tunnelAddresses() (netip.Addr, netip.Addr) {
 
 func (t *globalProtectTransport) Ready() bool {
 	return t.session != nil && t.session.Ready()
+}
+
+func (t *globalProtectTransport) WaitReady(ctx context.Context) error {
+	if t.session == nil {
+		return E.New("GlobalProtect tunnel is not ready")
+	}
+	return t.session.WaitReady(ctx)
 }
 
 func (t *globalProtectTransport) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {

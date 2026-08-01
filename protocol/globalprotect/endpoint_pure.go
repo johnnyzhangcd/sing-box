@@ -43,6 +43,9 @@ type Endpoint struct {
 	loopDone        chan struct{}
 	closeOnce       sync.Once
 	closeErr        error
+	firstReadyOnce  sync.Once
+	firstReadyDone  chan struct{}
+	firstReadyErr   error
 
 	transportAccess sync.RWMutex
 	transport       tunnelTransport
@@ -67,36 +70,49 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, err
 	}
 	return &Endpoint{
-		Adapter:     endpoint.NewAdapterWithDialerOptions(Cst.TypeGlobalProtect, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
-		loopContext: loopContext,
-		cancelLoop:  cancelLoop,
-		logger:      logger,
-		dnsRouter:   service.FromContext[adapter.DNSRouter](ctx),
-		options:     options,
-		client:      client,
-		loopDone:    make(chan struct{}),
+		Adapter:        endpoint.NewAdapterWithDialerOptions(Cst.TypeGlobalProtect, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
+		loopContext:    loopContext,
+		cancelLoop:     cancelLoop,
+		logger:         logger,
+		dnsRouter:      service.FromContext[adapter.DNSRouter](ctx),
+		options:        options,
+		client:         client,
+		loopDone:       make(chan struct{}),
+		firstReadyDone: make(chan struct{}),
 	}, nil
 }
 
 func (e *Endpoint) Start(stage adapter.StartStage) error {
-	if stage != adapter.StartStatePostStart {
+	waitForReady := e.options.WaitForReady
+	if waitForReady && stage != adapter.StartStateStart {
+		return nil
+	}
+	if !waitForReady && stage != adapter.StartStatePostStart {
 		return nil
 	}
 	e.lifecycleAccess.Lock()
-	defer e.lifecycleAccess.Unlock()
 	if e.closed {
+		e.lifecycleAccess.Unlock()
 		return net.ErrClosed
 	}
-	if e.started {
-		return nil
+	if !e.started {
+		e.started = true
+		go e.startLoop()
 	}
-	e.started = true
-	go e.startLoop()
+	e.lifecycleAccess.Unlock()
+	if waitForReady {
+		return e.waitFirstReady(e.loopContext)
+	}
 	return nil
 }
 
 func (e *Endpoint) startLoop() {
 	defer close(e.loopDone)
+	defer func() {
+		if err := e.loopContext.Err(); err != nil {
+			e.signalFirstReady(err)
+		}
+	}()
 	reconnectTimeout := normalizedReconnectTimeout(time.Duration(e.options.ReconnectTimeout))
 	var backoff retryBackoff
 	for {
@@ -114,6 +130,7 @@ func (e *Endpoint) startLoop() {
 				}
 				e.transport = transport
 				e.transportAccess.Unlock()
+				e.signalFirstReady(nil)
 				e.periodicHIPLoop(reconnectTimeout)
 				return
 			}
@@ -124,6 +141,7 @@ func (e *Endpoint) startLoop() {
 		}
 		if isPermanentRetry(err) {
 			_ = e.client.closeControl()
+			e.signalFirstReady(err)
 			if e.logger != nil {
 				e.logger.Error("GlobalProtect connection stopped after a permanent authentication or configuration error: ", err)
 			}
@@ -137,6 +155,52 @@ func (e *Endpoint) startLoop() {
 			return
 		}
 	}
+}
+
+func (e *Endpoint) signalFirstReady(err error) {
+	e.firstReadyOnce.Do(func() {
+		e.firstReadyErr = err
+		close(e.firstReadyDone)
+	})
+}
+
+func (e *Endpoint) waitFirstReady(ctx context.Context) error {
+	select {
+	case <-e.firstReadyDone:
+		return e.firstReadyErr
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-e.loopContext.Done():
+		select {
+		case <-e.firstReadyDone:
+			return e.firstReadyErr
+		default:
+			return e.loopContext.Err()
+		}
+	}
+}
+
+func (e *Endpoint) readyTransport(ctx context.Context) (tunnelTransport, error) {
+	transport := e.currentTransport()
+	if transport != nil && transport.Ready() {
+		return transport, nil
+	}
+	if !e.options.WaitForReady {
+		return nil, E.New("GlobalProtect tunnel is not ready")
+	}
+	if transport == nil {
+		if err := e.waitFirstReady(ctx); err != nil {
+			return nil, err
+		}
+		transport = e.currentTransport()
+	}
+	if transport == nil {
+		return nil, E.New("GlobalProtect tunnel is not ready")
+	}
+	if err := transport.WaitReady(ctx); err != nil {
+		return nil, err
+	}
+	return transport, nil
 }
 
 func (e *Endpoint) periodicHIPLoop(checkTimeout time.Duration) {
@@ -237,9 +301,9 @@ func (e *Endpoint) currentTransport() tunnelTransport {
 }
 
 func (e *Endpoint) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	transport := e.currentTransport()
-	if transport == nil || !transport.Ready() {
-		return nil, E.New("GlobalProtect tunnel is not ready")
+	transport, err := e.readyTransport(ctx)
+	if err != nil {
+		return nil, err
 	}
 	if e.logger != nil {
 		switch N.NetworkName(network) {
@@ -266,9 +330,9 @@ func (e *Endpoint) DialContext(ctx context.Context, network string, destination 
 }
 
 func (e *Endpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	transport := e.currentTransport()
-	if transport == nil || !transport.Ready() {
-		return nil, E.New("GlobalProtect tunnel is not ready")
+	transport, err := e.readyTransport(ctx)
+	if err != nil {
+		return nil, err
 	}
 	if e.logger != nil {
 		e.logger.InfoContext(ctx, "outbound packet connection to ", destination)
