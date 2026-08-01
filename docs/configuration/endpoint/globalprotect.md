@@ -97,7 +97,10 @@ The system hostname is used by default.
 
 #### reported_os
 
-Override the operating system string reported to the portal.
+Optional compatibility override for the operating system string reported to the portal.
+
+When omitted, the value is detected automatically from the runtime platform. macOS reports `mac-intel`
+on both Intel and Apple Silicon, as required by the GlobalProtect protocol.
 
 Supported values include `linux`, `linux-64`, `win`, `mac-intel`, `android`, and `apple-ios`.
 

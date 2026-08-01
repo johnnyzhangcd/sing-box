@@ -97,7 +97,10 @@ GlobalProtect 门户或网关的主机名。也可以直接提供完整的 `http
 
 #### reported_os
 
-覆盖向门户报告的操作系统字符串。
+可选的兼容性覆盖项，用于指定向门户报告的操作系统字符串。
+
+省略时会根据运行平台自动检测。无论 Intel 还是 Apple Silicon，macOS 都会按照 GlobalProtect
+协议要求报告为 `mac-intel`，无需用户配置。
 
 支持的值包括 `linux`、`linux-64`、`win`、`mac-intel`、`android` 和 `apple-ios`。
 

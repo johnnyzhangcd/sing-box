@@ -404,7 +404,7 @@
 
     <section aria-labelledby="run-title">
       <h2 id="run-title">构建与最小配置</h2>
-      <p class="section-intro">GlobalProtect 与 gVisor 是显式构建特性。下面的示例不会创建系统 TUN；将 mixed inbound 绑定在回环地址即可保持隔离。</p>
+      <p class="section-intro">GlobalProtect 与 gVisor 是显式构建特性。下面的示例不会创建系统 TUN；将 mixed inbound 绑定在回环地址即可保持隔离。平台标识会自动检测，macOS 在 Intel 与 Apple Silicon 上都会按协议要求报告为 <code>mac-intel</code>。</p>
       <pre><code>CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
   go build -tags "with_globalprotect,with_gvisor" \
   -o sing-box-globalprotect ./cmd/sing-box</code></pre>
@@ -416,7 +416,6 @@
     "server_port": 443,
     "username": "alice",
     "password": "&lt;redacted&gt;",
-    "reported_os": "linux-64",
     "disable_dtls": true,
     "reconnect_timeout": "5m"
   }],

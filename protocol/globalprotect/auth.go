@@ -70,7 +70,7 @@ func (q *queryBuilder) String() string {
 }
 
 func gpstClientOS(reported string) string {
-	switch strings.ToLower(strings.TrimSpace(reported)) {
+	switch strings.ToLower(gpstPlatformName(reported)) {
 	case "mac-intel":
 		return "Mac"
 	case "apple-ios":
@@ -85,19 +85,25 @@ func gpstClientOS(reported string) string {
 }
 
 func gpstPlatformName(reported string) string {
+	return gpstPlatformNameFor(reported, runtime.GOOS, runtime.GOARCH)
+}
+
+func gpstPlatformNameFor(reported, goOS, goArch string) string {
 	reported = strings.TrimSpace(reported)
 	if reported != "" {
 		return reported
 	}
-	switch runtime.GOOS {
+	switch goOS {
 	case "darwin":
 		return "mac-intel"
+	case "ios":
+		return "apple-ios"
 	case "windows":
 		return "win"
 	case "android":
 		return "android"
 	default:
-		if runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64" {
+		if goArch == "amd64" || goArch == "arm64" {
 			return "linux-64"
 		}
 		return "linux"

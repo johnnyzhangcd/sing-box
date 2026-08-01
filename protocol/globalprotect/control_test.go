@@ -229,6 +229,46 @@ func TestGPSTClientOS(t *testing.T) {
 	}
 }
 
+func TestGPSTClientOSDefaultsToRuntimePlatform(t *testing.T) {
+	reportedOS := gpstPlatformName("")
+	if reportedOS == "" {
+		t.Fatal("runtime platform name must not be empty")
+	}
+	if got, want := gpstClientOS(""), gpstClientOS(reportedOS); got != want {
+		t.Fatalf("empty reported OS resolved to clientos %q, want runtime platform %q (%q)", got, want, reportedOS)
+	}
+}
+
+func TestGPSTPlatformNameDefaults(t *testing.T) {
+	tests := []struct {
+		name   string
+		goOS   string
+		goArch string
+		want   string
+	}{
+		{"macOS on Apple Silicon", "darwin", "arm64", "mac-intel"},
+		{"macOS on Intel", "darwin", "amd64", "mac-intel"},
+		{"iOS", "ios", "arm64", "apple-ios"},
+		{"Windows", "windows", "arm64", "win"},
+		{"Android", "android", "arm64", "android"},
+		{"64-bit Linux", "linux", "arm64", "linux-64"},
+		{"32-bit Linux", "linux", "386", "linux"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := gpstPlatformNameFor("", test.goOS, test.goArch); got != test.want {
+				t.Fatalf("gpstPlatformNameFor(\"\", %q, %q) = %q, want %q", test.goOS, test.goArch, got, test.want)
+			}
+		})
+	}
+}
+
+func TestGPSTPlatformNamePreservesOverride(t *testing.T) {
+	if got := gpstPlatformNameFor(" mac-intel ", "linux", "arm64"); got != "mac-intel" {
+		t.Fatalf("explicit reported OS override was not preserved: %q", got)
+	}
+}
+
 func TestParseLogoutXML(t *testing.T) {
 	if err := parseLogoutXML([]byte(`<response status="success"/>`)); err != nil {
 		t.Fatal(err)
